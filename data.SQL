@@ -371,4 +371,279 @@ CREATE TRIGGER tr_user_balance_update
 BEGIN
     IF OLD.wallet_balance != NEW.wallet_balance THEN
         INSERT INTO system_logs (log_level, category, message, context, user_id)
-        VALUES ('info', '
+        VALUES ('info', 'wallet', 'Wallet balance updated', 
+                JSON_OBJECT('old_balance', OLD.wallet_balance, 'new_balance', NEW.wallet_balance), 
+                NEW.id);
+    END IF;
+END//
+
+CREATE TRIGGER tr_charging_transaction_status_update
+    AFTER UPDATE ON charging_transactions
+    FOR EACH ROW
+BEGIN
+    IF OLD.status != NEW.status THEN
+        INSERT INTO system_logs (log_level, category, message, context, user_id)
+        VALUES ('info', 'charging', 'Charging transaction status changed', 
+                JSON_OBJECT('transaction_code', NEW.transaction_code, 'old_status', OLD.status, 'new_status', NEW.status), 
+                NEW.user_id);
+    END IF;
+END//
+
+CREATE TRIGGER tr_station_status_update
+    AFTER UPDATE ON charging_stations
+    FOR EACH ROW
+BEGIN
+    IF OLD.status != NEW.status THEN
+        INSERT INTO system_logs (log_level, category, message, context)
+        VALUES ('info', 'station', 'Charging station status changed', 
+                JSON_OBJECT('station_code', NEW.station_code, 'old_status', OLD.status, 'new_status', NEW.status));
+    END IF;
+END//
+
+DELIMITER ;
+
+-- Create stored procedures for common operations
+DELIMITER //
+
+CREATE PROCEDURE sp_start_charging_session(
+    IN p_user_id INT,
+    IN p_vehicle_id INT,
+    IN p_station_id INT,
+    IN p_ocpp_transaction_id INT,
+    OUT p_transaction_code VARCHAR(50)
+)
+BEGIN
+    DECLARE v_transaction_count INT;
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        RESIGNAL;
+    END;
+
+    START TRANSACTION;
+    
+    -- Generate unique transaction code
+    SELECT COUNT(*) + 1 INTO v_transaction_count FROM charging_transactions WHERE DATE(created_at) = CURDATE();
+    SET p_transaction_code = CONCAT('TX', DATE_FORMAT(NOW(), '%Y%m%d'), LPAD(v_transaction_count, 4, '0'));
+    
+    -- Insert charging transaction
+    INSERT INTO charging_transactions (
+        transaction_code, user_id, vehicle_id, station_id, ocpp_transaction_id, 
+        start_time, status
+    ) VALUES (
+        p_transaction_code, p_user_id, p_vehicle_id, p_station_id, p_ocpp_transaction_id,
+        NOW(), 'preparing'
+    );
+    
+    -- Update station status
+    UPDATE charging_stations SET status = 'occupied' WHERE id = p_station_id;
+    
+    COMMIT;
+END//
+
+CREATE PROCEDURE sp_complete_charging_session(
+    IN p_transaction_code VARCHAR(50),
+    IN p_end_meter_value DECIMAL(10,3),
+    IN p_stop_reason VARCHAR(50)
+)
+BEGIN
+    DECLARE v_start_meter DECIMAL(10,3);
+    DECLARE v_energy_delivered DECIMAL(10,3);
+    DECLARE v_station_id INT;
+    DECLARE v_pea_price DECIMAL(6,4);
+    DECLARE v_solar_price DECIMAL(6,4);
+    DECLARE v_total_cost DECIMAL(10,2);
+    
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        RESIGNAL;
+    END;
+
+    START TRANSACTION;
+    
+    -- Get transaction details
+    SELECT start_meter_value, station_id INTO v_start_meter, v_station_id
+    FROM charging_transactions 
+    WHERE transaction_code = p_transaction_code;
+    
+    -- Calculate energy delivered
+    SET v_energy_delivered = p_end_meter_value - v_start_meter;
+    
+    -- Get current pricing
+    SELECT price_per_kwh INTO v_pea_price FROM electricity_pricing 
+    WHERE source_type = 'pea' AND status = 'active' ORDER BY effective_date DESC LIMIT 1;
+    
+    SELECT price_per_kwh INTO v_solar_price FROM electricity_pricing 
+    WHERE source_type = 'solar' AND status = 'active' ORDER BY effective_date DESC LIMIT 1;
+    
+    -- Calculate cost (50% solar, 50% PEA for demo)
+    SET v_total_cost = (v_energy_delivered * 0.5 * v_solar_price) + (v_energy_delivered * 0.5 * v_pea_price);
+    
+    -- Update transaction
+    UPDATE charging_transactions SET 
+        end_time = NOW(),
+        end_meter_value = p_end_meter_value,
+        energy_delivered = v_energy_delivered,
+        total_cost = v_total_cost,
+        solar_cost = v_energy_delivered * 0.5 * v_solar_price,
+        pea_cost = v_energy_delivered * 0.5 * v_pea_price,
+        status = 'completed',
+        stop_reason = p_stop_reason
+    WHERE transaction_code = p_transaction_code;
+    
+    -- Update station status
+    UPDATE charging_stations SET status = 'available' WHERE id = v_station_id;
+    
+    COMMIT;
+END//
+
+CREATE PROCEDURE sp_process_payment(
+    IN p_user_id INT,
+    IN p_payment_type ENUM('topup', 'charging', 'refund'),
+    IN p_payment_method ENUM('qr_promptpay', 'credit_card', 'bank_transfer', 'wallet'),
+    IN p_amount DECIMAL(10,2),
+    IN p_charging_transaction_id INT,
+    IN p_reference_id VARCHAR(100),
+    OUT p_payment_success BOOLEAN
+)
+BEGIN
+    DECLARE v_current_balance DECIMAL(10,2);
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        SET p_payment_success = FALSE;
+        RESIGNAL;
+    END;
+
+    START TRANSACTION;
+    
+    SET p_payment_success = TRUE;
+    
+    -- Insert payment record
+    INSERT INTO payment_transactions (
+        user_id, charging_transaction_id, payment_type, payment_method, 
+        amount, reference_id, status
+    ) VALUES (
+        p_user_id, p_charging_transaction_id, p_payment_type, p_payment_method,
+        p_amount, p_reference_id, 'completed'
+    );
+    
+    -- Update user wallet balance
+    IF p_payment_type = 'topup' THEN
+        UPDATE users SET wallet_balance = wallet_balance + p_amount WHERE id = p_user_id;
+    ELSEIF p_payment_type = 'charging' THEN
+        SELECT wallet_balance INTO v_current_balance FROM users WHERE id = p_user_id;
+        IF v_current_balance >= p_amount THEN
+            UPDATE users SET wallet_balance = wallet_balance - p_amount WHERE id = p_user_id;
+        ELSE
+            SET p_payment_success = FALSE;
+            ROLLBACK;
+        END IF;
+    ELSEIF p_payment_type = 'refund' THEN
+        UPDATE users SET wallet_balance = wallet_balance + p_amount WHERE id = p_user_id;
+    END IF;
+    
+    IF p_payment_success THEN
+        COMMIT;
+    END IF;
+END//
+
+DELIMITER ;
+
+-- Create function for generating QR payment codes
+DELIMITER //
+
+CREATE FUNCTION f_generate_qr_payment_code(
+    p_amount DECIMAL(10,2),
+    p_reference VARCHAR(50)
+) RETURNS TEXT
+READS SQL DATA
+DETERMINISTIC
+BEGIN
+    DECLARE v_qr_code TEXT;
+    -- This would integrate with PromptPay API in real implementation
+    -- For demo purposes, return a formatted string
+    SET v_qr_code = CONCAT('00020101021230570016A000000677010111011300', 
+                          LPAD(CAST(p_amount * 100 AS UNSIGNED), 10, '0'), 
+                          '02', LPAD(LENGTH(p_reference), 2, '0'), p_reference, '6304');
+    RETURN v_qr_code;
+END//
+
+DELIMITER ;
+
+-- Sample data for testing
+INSERT INTO users (email, password_hash, first_name, last_name, phone, wallet_balance) VALUES
+('john.doe@email.com', '$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi', 'John', 'Doe', '0812345678', 1500.00),
+('jane.smith@email.com', '$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi', 'Jane', 'Smith', '0823456789', 850.00),
+('mike.wilson@email.com', '$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi', 'Mike', 'Wilson', '0834567890', 2200.00);
+
+INSERT INTO employees (employee_code, email, password_hash, first_name, last_name, position, role) VALUES
+('EMP001', 'manager@evcharging.com', '$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi', 'สมชาย', 'ใจดี', 'ผู้จัดการ', 'manager'),
+('EMP002', 'tech@evcharging.com', '$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi', 'สมหญิง', 'รักงาน', 'เทคนิค', 'technician'),
+('EMP003', 'support@evcharging.com', '$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi', 'สมศักดิ์', 'ช่วยเหลือ', 'ฝ่ายบริการ', 'support');
+
+INSERT INTO vehicles (user_id, license_plate, brand, model, battery_capacity, max_charging_power) VALUES
+(1, 'กข-1234', 'Tesla', 'Model 3', 75.00, 22.00),
+(1, 'กข-5678', 'Tesla', 'Model Y', 82.00, 22.00),
+(2, 'กค-9012', 'Nissan', 'Leaf', 40.00, 22.00),
+(3, 'กง-3456', 'BMW', 'iX3', 80.00, 50.00);
+
+-- Insert sample energy data for the last 24 hours
+INSERT INTO energy_data (source_type, source_id, timestamp, power_generated, energy_total, battery_soc, voltage, current, temperature)
+SELECT 
+    'solar', 1, 
+    DATE_SUB(NOW(), INTERVAL n HOUR),
+    CASE 
+        WHEN TIME(DATE_SUB(NOW(), INTERVAL n HOUR)) BETWEEN '06:00:00' AND '18:00:00' 
+        THEN ROUND(RAND() * 25 + 5, 2)  -- 5-30 kW during day
+        ELSE ROUND(RAND() * 2, 2)       -- 0-2 kW at night
+    END,
+    ROUND(RAND() * 500 + 1000, 2),      -- Total energy
+    ROUND(RAND() * 20 + 70, 2),         -- 70-90% SOC
+    ROUND(RAND() * 50 + 380, 2),        -- 380-430V
+    ROUND(RAND() * 100 + 10, 2),        -- 10-110A
+    ROUND(RAND() * 15 + 25, 2)          -- 25-40°C
+FROM (
+    SELECT 0 n UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5 
+    UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9 UNION SELECT 10 UNION SELECT 11
+    UNION SELECT 12 UNION SELECT 13 UNION SELECT 14 UNION SELECT 15 UNION SELECT 16 UNION SELECT 17
+    UNION SELECT 18 UNION SELECT 19 UNION SELECT 20 UNION SELECT 21 UNION SELECT 22 UNION SELECT 23
+) hours;
+
+-- Insert sample completed transactions
+INSERT INTO charging_transactions (
+    transaction_code, user_id, vehicle_id, station_id, start_time, end_time,
+    start_meter_value, end_meter_value, energy_delivered, total_cost, status
+) VALUES
+('TX202508020001', 1, 1, 1, DATE_SUB(NOW(), INTERVAL 2 HOUR), DATE_SUB(NOW(), INTERVAL 1 HOUR), 
+ 100.0, 125.5, 25.5, 102.00, 'completed'),
+('TX202508020002', 2, 3, 2, DATE_SUB(NOW(), INTERVAL 4 HOUR), DATE_SUB(NOW(), INTERVAL 3 HOUR), 
+ 50.0, 68.2, 18.2, 72.80, 'completed'),
+('TX202508020003', 3, 4, 3, DATE_SUB(NOW(), INTERVAL 6 HOUR), DATE_SUB(NOW(), INTERVAL 4 HOUR), 
+ 200.0, 240.8, 40.8, 163.20, 'completed');
+
+-- Insert corresponding payment transactions
+INSERT INTO payment_transactions (
+    user_id, charging_transaction_id, payment_type, payment_method, amount, status, processed_at
+) SELECT 
+    ct.user_id, ct.id, 'charging', 'wallet', ct.total_cost, 'completed', ct.end_time
+FROM charging_transactions ct WHERE ct.status = 'completed';
+
+-- Create performance optimization indexes
+CREATE INDEX idx_energy_data_hour ON energy_data(DATE(timestamp), HOUR(timestamp));
+CREATE INDEX idx_transactions_daily ON charging_transactions(DATE(start_time), status);
+CREATE INDEX idx_users_active ON users(status, created_at);
+CREATE INDEX idx_stations_location ON charging_stations(latitude, longitude, status);
+
+-- Final database optimization
+ANALYZE TABLE users, employees, vehicles, charging_stations, charging_transactions, payment_transactions, energy_data;
+
+-- Show database structure summary
+SELECT 
+    TABLE_NAME,
+    TABLE_ROWS,
+    ROUND(((DATA_LENGTH + INDEX_LENGTH) / 1024 / 1024), 2) AS 'Size (MB)'
+FROM information_schema.TABLES 
+WHERE TABLE_SCHEMA = 'ev_charging_system'
+ORDER BY (DATA_LENGTH + INDEX_LENGTH) DESC;
