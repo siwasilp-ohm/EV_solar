@@ -339,4 +339,46 @@ if (file_exists(__DIR__ . '/local_config.php')) {
 // Validate configuration on load
 $configErrors = AppConfig::validateConfig();
 if (!empty($configErrors)) {
-    error_log('Configuration errors
+    error_log('Configuration errors: ' . implode(', ', $configErrors));
+    if (AppConfig::isProduction()) {
+        throw new Exception('System configuration error');
+    }
+}
+
+// Set error reporting based on environment
+if (AppConfig::isDevelopment()) {
+    error_reporting(E_ALL);
+    ini_set('display_errors', 1);
+} else {
+    error_reporting(E_ERROR | E_WARNING | E_PARSE);
+    ini_set('display_errors', 0);
+}
+
+// Set timezone
+date_default_timezone_set('Asia/Bangkok');
+
+// Define application constants
+define('APP_ENV', getenv('APP_ENV') ?: 'development');
+define('BASE_PATH', dirname(__DIR__));
+define('PUBLIC_PATH', BASE_PATH . '/public');
+define('STORAGE_PATH', BASE_PATH . '/storage');
+
+// Auto-load classes
+spl_autoload_register(function ($className) {
+    $paths = [
+        BASE_PATH . '/models/',
+        BASE_PATH . '/controllers/',
+        BASE_PATH . '/services/',
+        BASE_PATH . '/helpers/'
+    ];
+    
+    foreach ($paths as $path) {
+        $file = $path . $className . '.php';
+        if (file_exists($file)) {
+            require_once $file;
+            return;
+        }
+    }
+});
+
+?>
